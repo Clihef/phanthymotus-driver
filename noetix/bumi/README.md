@@ -1,6 +1,8 @@
 # Noetix Bumi driver
 
-The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
+The bundle exposes the original Bumi sensor, locomotion, audio and camera cards,
+the higher-level motion-state card, and an EDU-only LowController arm card.
+All card implementations are kept in `device.py`.
 
 ## New cards
 
@@ -23,6 +25,33 @@ field for device-side verification.
 Every published state identifies `Noetix HighController/CycloneDDS` as its source and includes a freshness flag. It deliberately excludes battery data, which belongs to the existing `battery` card. The SDK does not expose world-frame position or translational velocity, so the card reports only documented IMU and joint measurements and does not invent odometry.
 
 ## Direct action cards
+
+### `arm`
+
+Moves the left arm, right arm, or both arms through the EDU-only LowController.
+Each supplied arm is a four-number array in degrees ordered as shoulder pitch,
+shoulder roll, shoulder yaw and elbow pitch. At least one arm must be supplied;
+an omitted side stays at its measured starting angles. `speed_deg_s` is limited
+to 5-30 degrees per second and defaults to 20.
+
+The card sends commands only when HighController reports workmode 2
+(`walking`). It does not switch modes automatically. Missing workmode feedback,
+disabled, enabled, ready, action and protection modes are all rejected before a
+LowController command is sent.
+
+The driver validates the documented limit of each of the eight arm joints,
+converts degrees to radians, interpolates a smooth trajectory and reports
+`completed` only when measured LowController feedback is within 5 degrees of
+every requested target. KP, KD and torque are internal fixed values and are not
+card inputs.
+
+LowController requires a complete 21-motor command even for arm-only movement.
+The driver therefore holds every non-target joint at the position measured when
+the trajectory starts. This is not a balancing controller. Follow the vendor
+requirement to secure Bumi with a load-bearing safety hanger for LowController
+testing, and never run a HighController motion card concurrently. The walking
+precondition verifies preparation state; it does not turn this static
+whole-body hold into a balancing controller.
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
 `enable`, `ready` and `walk` transitions are completed automatically and are no
