@@ -100,6 +100,18 @@ plugins:
     max_step_rad: 0.025
     publish_rate_hz: 20.0
     hold_repetitions: 3
+  lower_body_control:
+    enabled: true
+    # Waist/hip/knee/ankle are load-bearing joints. Keep physical execution
+    # disabled until the guarded relative-motion card is validated on the
+    # target Q5 with an operator holding the emergency stop.
+    hardware_enable: false
+    max_delta_rad: 0.030
+    max_step_rad: 0.005
+    publish_rate_hz: 20.0
+    hold_repetitions: 3
+    settle_tolerance_rad: 0.020
+    settle_timeout_s: 1.5
   odom:
     enabled: true
   teleop_state:

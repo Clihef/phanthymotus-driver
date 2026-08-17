@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-q5_bundle/main.py — RobotEra Q5 只读状态驱动入口。
+q5_bundle/main.py — RobotEra Q5 状态与受保护控制驱动入口。
 
 一个驱动 = 一个 MCP server。本 bundle 按 config.yaml 里启用的卡名自动 import
 同名模块并装配（约定：config key == 模块名 == 文件名 == 卡名）。
 新增一张卡 = 新建 `<卡名>.py` + 在 config.yaml 打开它，不用改本文件。
 
-所有卡共享同一个只读 ROS2 客户端（Q5SdkClient）。无 rclpy 或无硬件时自动 STUB
+所有卡共享同一个 ROS2 状态客户端（Q5SdkClient）；手臂、头部和下半身控制卡
+还共享带租约的身体命令发布器。无 rclpy 或无硬件时自动 STUB
 （server 仍能起、注册、列 tool）。
 
 用法： python3 main.py   环境变量： CONFIG_PATH / AGENT_CORE_URL
@@ -173,7 +174,15 @@ def make_handler():
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        tool_result = {
+                            "content": [{"type": "text", "text": json.dumps(result)}],
+                        }
+                        if (isinstance(result, dict)
+                                and (result.get("state") == "error"
+                                     or result.get("ok") is False
+                                     or "error" in result)):
+                            tool_result["isError"] = True
+                        ok(tool_result)
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:

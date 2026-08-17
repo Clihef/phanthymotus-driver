@@ -17,6 +17,7 @@ import estop
 import hand_control
 import hand_gesture
 import head_control
+import lower_body_control
 import hand_state
 import joints
 import joints_state
@@ -319,14 +320,21 @@ class Q5BasicSensorTests(unittest.TestCase):
             (hand_control, "set", {"targets": [{"joint_name": hand_control.HAND_JOINTS[0], "position_rad": 0.1}]}),
             (hand_gesture, "light_grip", {}),
             (head_control, "neck_yaw", {"neck_yaw_rad": 0.1}),
+            (lower_body_control, "adjust_waist_yaw", {"waist_yaw_delta_rad": 0.01}),
         ):
             plugin = module.Plugin({}, "test", None, _Client())
             result = plugin.dispatch(action, args)
-            expected_code = "ARM_CONTROL_DISABLED" if module is arm_control else "ROS_UNAVAILABLE"
+            if module is arm_control:
+                expected_code = "ARM_CONTROL_DISABLED"
+            elif module is lower_body_control:
+                expected_code = "LOWER_BODY_CONTROL_DISABLED"
+            else:
+                expected_code = "ROS_UNAVAILABLE"
             self.assertEqual(result["code"], expected_code, module.CARD)
 
     def test_control_schemas_expose_action_specific_frontend_forms(self):
-        cards = (base_drive, simple_action, arm_control, hand_control, hand_gesture, head_control)
+        cards = (base_drive, simple_action, arm_control, hand_control, hand_gesture,
+                 head_control, lower_body_control)
         for module in cards:
             schema = module.Plugin({}, "test", None, _Client()).get_tool()["inputSchema"]
             self.assertIn("x-action-params", schema, module.CARD)
@@ -350,7 +358,8 @@ class Q5BasicSensorTests(unittest.TestCase):
         gesture_schema = hand_gesture.Plugin({}, "test", None, _Client()).get_tool()["inputSchema"]
         self.assertNotIn("gesture", gesture_schema["properties"])
         self.assertNotIn("open", gesture_schema["properties"]["action"]["enum"])
-        for module in (simple_action, arm_control, hand_control, hand_gesture, head_control):
+        for module in (simple_action, arm_control, hand_control, hand_gesture,
+                       head_control, lower_body_control):
             schema = module.Plugin({}, "test", None, _Client()).get_tool()["inputSchema"]
             self.assertNotIn("duration_s", schema["properties"], module.CARD)
         base_schema = base_drive.Plugin({}, "test", None, _Client()).get_tool()["inputSchema"]
@@ -392,8 +401,100 @@ class Q5BasicSensorTests(unittest.TestCase):
         client = _Client()
         arm = arm_control.Plugin({"hardware_enable": True}, "test", None, client)
         head = head_control.Plugin({}, "test", None, client)
+        lower = lower_body_control.Plugin({"hardware_enable": True}, "test", None, client)
         self.assertIs(arm._router, head._router)
+        self.assertIs(arm._router, lower._router)
         self.assertEqual(arm._router.status()["topic"], "/wr1_controller/commands")
+
+    def test_lower_body_control_schema_has_safe_relative_defaults(self):
+        plugin = lower_body_control.Plugin({}, "test", None, _Client())
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(set(schema["properties"]["action"]["enum"]),
+                         set(schema["x-action-params"]))
+        expected = {
+            "adjust_ankle": "ankle_delta_rad",
+            "adjust_knee": "knee_delta_rad",
+            "adjust_hip": "hip_delta_rad",
+            "adjust_waist_yaw": "waist_yaw_delta_rad",
+        }
+        for action, field in expected.items():
+            definition = schema["properties"][field]
+            self.assertEqual(definition["default"], 0.0)
+            self.assertEqual(definition["minimum"], -0.03)
+            self.assertEqual(definition["maximum"], 0.03)
+            self.assertEqual(schema["x-action-params"][action]["params"], [field])
+        self.assertEqual(set(lower_body_control.LOWER_BODY_JOINTS), {
+            "ankle_joint", "knee_joint", "hip_joint", "waist_yaw_joint",
+        })
+
+    def test_lower_body_control_is_hard_disabled_by_default(self):
+        plugin = lower_body_control.Plugin({"enabled": True}, "test", None, _Client())
+        self.assertIsNone(plugin._router)
+        self.assertEqual(plugin.dispatch("start", {})["state"], "disabled")
+        result = plugin.dispatch("adjust_knee", {"knee_delta_rad": 0.01})
+        self.assertEqual(result["code"], "LOWER_BODY_CONTROL_DISABLED")
+
+    def test_lower_body_relative_target_uses_live_feedback_and_urdf_limits(self):
+        class ActiveClient(_Client):
+            q5_position_control_prepared = True
+
+            def snapshot(self):
+                return {
+                    **FRESH_JOINT_SNAPSHOT,
+                    "received_at_ms": 1000,
+                    "joints": {
+                        "ankle_joint": 0.20,
+                        "knee_joint": -0.50,
+                        "hip_joint": 0.10,
+                        "waist_yaw_joint": 0.0,
+                    },
+                }
+
+        plugin = lower_body_control.Plugin({"hardware_enable": True}, "test", None, ActiveClient())
+        plugin._router.status = lambda: {
+            "ros_publisher_available": True,
+            "other_publishers": [],
+            "same_name_publisher_count": 1,
+        }
+        command = plugin._validate_adjustment("adjust_knee", 0.02)
+        self.assertAlmostEqual(command["current_position_rad"], -0.50)
+        self.assertAlmostEqual(command["target_position_rad"], -0.48)
+        rejected = plugin._validate_adjustment("adjust_knee", 0.031)
+        self.assertEqual(rejected["code"], "DELTA_LIMIT_EXCEEDED")
+
+        near_limit = ActiveClient()
+        near_limit.snapshot = lambda: {
+            **FRESH_JOINT_SNAPSHOT,
+            "received_at_ms": 1000,
+            "joints": {"ankle_joint": 1.60},
+        }
+        near_limit.q5_position_control_prepared = True
+        limited = lower_body_control.Plugin({"hardware_enable": True}, "test", None, near_limit)
+        limited._router.status = plugin._router.status
+        result = limited._validate_adjustment("adjust_ankle", 0.02)
+        self.assertEqual(result["code"], "LIMIT_EXCEEDED")
+
+    def test_lower_body_feedback_requires_a_new_sample_within_tolerance(self):
+        class FeedbackClient(_Client):
+            def snapshot(self):
+                return {
+                    **FRESH_JOINT_SNAPSHOT,
+                    "received_at_ms": 1001,
+                    "joints": {"waist_yaw_joint": 0.019},
+                }
+
+        plugin = lower_body_control.Plugin(
+            {"hardware_enable": True, "settle_timeout_s": 0.05,
+             "settle_tolerance_rad": 0.005},
+            "test", None, FeedbackClient(),
+        )
+        feedback = plugin._wait_for_feedback({
+            "joint_name": "waist_yaw_joint",
+            "target_position_rad": 0.02,
+            "feedback_before_ms": 1000,
+        })
+        self.assertTrue(feedback["verified"])
+        self.assertAlmostEqual(feedback["position_error_rad"], 0.001)
 
     def test_arm_control_is_hard_disabled_without_explicit_hardware_enable(self):
         plugin = arm_control.Plugin({"enabled": True, "hardware_enable": False}, "test", None, _Client())
@@ -489,7 +590,8 @@ class Q5BasicSensorTests(unittest.TestCase):
         config = Path("config.yaml").read_text(encoding="utf-8")
         self.assertIn("simple_action:\n    # Vendor action service", config)
         self.assertIn("    enabled: false\n  arm_control:", config)
-        for card in ("base_drive", "arm_control", "hand_control", "hand_gesture", "head_control"):
+        for card in ("base_drive", "arm_control", "hand_control", "hand_gesture",
+                     "head_control", "lower_body_control"):
             match = re.search(rf"^  {card}:$(.*?)(?=^  \w|\Z)", config, re.MULTILINE | re.DOTALL)
             self.assertIsNotNone(match, card)
             self.assertIn("enabled: true", match.group(1), card)

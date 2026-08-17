@@ -25,7 +25,7 @@ BODY_KD = 20.0
 
 
 class BodyCommandRouter:
-    """One Q5 body publisher plus an in-process lease for arm/head cards."""
+    """One Q5 body publisher plus a lease for arm, head, and lower-body cards."""
 
     def __init__(self, executor):
         self._node = None
