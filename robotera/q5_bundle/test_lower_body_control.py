@@ -128,6 +128,39 @@ class LowerBodyControlTests(unittest.TestCase):
         result = plugin._validate_adjustment("set_hip", 5.0)
         self.assertEqual(result["code"], "BODY_COMMAND_CONFLICT")
 
+    def test_vendor_mpc_publisher_is_rejected_as_direct_control_conflict(self):
+        plugin = enabled_plugin()
+        plugin._router.status = lambda: {
+            "ros_publisher_available": True,
+            "other_publishers": [
+                {"node_name": "mpc_policy_node", "node_namespace": "/",
+                 "actively_publishing": True},
+            ],
+            "same_name_publisher_count": 1,
+        }
+        result = plugin._validate_adjustment("set_hip", 5.0)
+        self.assertEqual(result["code"], "MPC_CONTROL_CONFLICT")
+
+    def test_silent_remote_control_endpoint_is_allowed(self):
+        plugin = enabled_plugin()
+        plugin._router.status = lambda: {
+            "ros_publisher_available": True,
+            "other_publishers": [
+                {"node_name": "mpc_policy_node", "node_namespace": "/",
+                 "actively_publishing": False, "last_message_age_s": None},
+            ],
+            "same_name_publisher_count": 1,
+        }
+        command = plugin._validate_adjustment("set_hip", 5.0)
+        self.assertNotIn("code", command)
+        self.assertEqual(command["target_position_deg"], 5.0)
+
+    def test_unclassified_remote_endpoint_fails_closed(self):
+        result = lower_body_control.Plugin._external_command_conflict({
+            "other_publishers": [{"node_name": "mpc_policy_node"}],
+        })
+        self.assertEqual(result["code"], "MPC_CONTROL_CONFLICT")
+
     def test_duplicate_shared_body_publisher_is_rejected(self):
         plugin = enabled_plugin()
         plugin._router.status = lambda: {

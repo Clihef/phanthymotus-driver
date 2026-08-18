@@ -32,7 +32,9 @@ RobotEra Q5 的 MCP 驱动 bundle。插件由 `main.py` 按 `config.yaml` 动态
 2. 已准备但不在 ACTIVE 时，自动调用厂商 `activate_service`；
 3. 必须由 `/xbot_state` 新鲜反馈确认机器人已进入 `ACTIVE`；
 4. `/joint_states` 新鲜并包含目标关节；
-5. `/wr1_controller/commands` 没有其他发布者或卡片持有租约；
+5. `/wr1_controller/commands` 上保留但静默的遥控器/MPC端点可以共存；检测到其实际
+   命令流、监测状态未确定、其他活跃发布者、重复的 `q5_body_command` 或其他卡片持有
+   租约时拒绝执行，运动过程中恢复外部发布也会中止本卡片命令；
 6. 完成后收到更新的关节反馈，误差在配置容差内。
 
 承重关节会直接影响机器人稳定性。当前配置启用硬件执行；测试时必须清空工作区、

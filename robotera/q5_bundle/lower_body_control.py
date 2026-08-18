@@ -212,6 +212,31 @@ class Plugin:
         position = snap.get("joints", {}).get(joint_name)
         return self._hold_position(joint_name, position) if snap.get("fresh") else False
 
+    @staticmethod
+    def _external_command_conflict(status: dict):
+        # False means the endpoint remained silent for a complete observation
+        # window. True means recent traffic; None means monitoring has not yet
+        # established that the endpoint is quiet, so fail closed.
+        active = [endpoint for endpoint in status.get("other_publishers", [])
+                  if endpoint.get("actively_publishing") is not False]
+        mpc_publishers = [endpoint for endpoint in active
+                          if endpoint.get("node_name") == "mpc_policy_node"]
+        if mpc_publishers:
+            return _failure(
+                "MPC_CONTROL_CONFLICT",
+                "Remote-control/MPC command traffic must be quiet before direct joint-motor control",
+                mpc_publishers=mpc_publishers,
+                status=status,
+            )
+        if active:
+            return _failure(
+                "BODY_COMMAND_CONFLICT",
+                "Another node is actively publishing body commands or has not yet been proven quiet",
+                active_publishers=active,
+                status=status,
+            )
+        return None
+
     def _validate_adjustment(self, action: str, value):
         detail = ACTION_DETAILS[action]
         joint_name = detail["joint_name"]
@@ -247,12 +272,9 @@ class Plugin:
                 "Multiple q5_body_command publishers are active on the body command topic",
                 status=status,
             )
-        if status.get("other_publishers"):
-            return _failure(
-                "BODY_COMMAND_CONFLICT",
-                "Refusing lower-body motion while another node publishes body commands",
-                status=status,
-            )
+        conflict = self._external_command_conflict(status)
+        if conflict:
+            return conflict
         preflight_snapshot = self._client.snapshot()
         if (not preflight_snapshot.get("fresh")
                 or joint_name not in preflight_snapshot.get("joints", {})):
@@ -277,6 +299,9 @@ class Plugin:
                 preparation=preparation,
             )
         status = self._safety()
+        conflict = self._external_command_conflict(status)
+        if conflict:
+            return conflict
         q5_ready, q5_status = q5_is_control_ready(self._client)
         if (not status["position_control_prepared"] or not q5_ready
                 or q5_status.get("state") != 4):
@@ -371,15 +396,22 @@ class Plugin:
             1,
         )
         published = False
+        conflict_result = None
         try:
             for index in range(1, steps + 1):
                 if stop_event.is_set():
+                    break
+                conflict_result = self._external_command_conflict(
+                    self._router.status())
+                if conflict_result:
                     break
                 position = current + (target - current) * index / steps
                 published = self._publish(joint_name, position) or published
                 stop_event.wait(duration_s / steps if duration_s else 0.0)
 
-            if stop_event.is_set():
+            if conflict_result:
+                result = conflict_result
+            elif stop_event.is_set():
                 held = self._hold_current(joint_name)
                 result = {
                     "ok": True,
