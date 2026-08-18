@@ -42,6 +42,7 @@ FRESH_JOINT_SNAPSHOT = {
 
 class _Client:
     q5_position_control_prepared = True
+    q5_direct_joint_control_prepared = True
 
     def snapshot(self):
         return dict(FRESH_JOINT_SNAPSHOT)
@@ -55,6 +56,12 @@ class _Client:
     def ensure_q5_position_control_active(self):
         self.q5_position_control_prepared = True
         return {"ok": True, "state": "active", "steps": []}
+
+    def ensure_q5_direct_joint_active(self):
+        self.q5_direct_joint_control_prepared = True
+        return {"ok": True, "state": "active",
+                "direct_joint_control_prepared": True,
+                "preparation_profile": "direct_joint_minimal", "steps": []}
 
 
 class _LifecycleFuture:

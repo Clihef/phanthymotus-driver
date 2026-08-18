@@ -23,6 +23,7 @@ class Client:
         self.received_at_ms = received_at_ms
         self.state = state
         self.q5_position_control_prepared = prepared
+        self.q5_direct_joint_control_prepared = prepared
         self.ensure_calls = 0
 
     def snapshot(self):
@@ -38,11 +39,18 @@ class Client:
             return {"available": True, "fresh": True, "state": self.state}
         return {}
 
-    def ensure_q5_position_control_active(self):
+    def ensure_q5_direct_joint_active(self):
         self.ensure_calls += 1
         self.state = 4
-        self.q5_position_control_prepared = True
-        return {"ok": True, "state": "active", "steps": []}
+        self.q5_direct_joint_control_prepared = True
+        return {"ok": True, "state": "active",
+                "direct_joint_control_prepared": True,
+                "preparation_profile": "direct_joint_minimal",
+                "steps": [
+                    {"step": "dynamic_launch_pos", "success": True},
+                    {"step": "ready_service", "success": True},
+                    {"step": "activate_service", "success": True},
+                ]}
 
     def get_lifecycle_state(self):
         return "active"
@@ -115,8 +123,17 @@ class LowerBodyControlTests(unittest.TestCase):
         command = plugin._validate_adjustment("set_hip", 5.0)
         self.assertEqual(client.ensure_calls, 1)
         self.assertEqual(client.state, 4)
-        self.assertTrue(client.q5_position_control_prepared)
+        self.assertFalse(client.q5_position_control_prepared)
+        self.assertTrue(client.q5_direct_joint_control_prepared)
         self.assertEqual(command["automatic_preparation"]["state"], "active")
+        self.assertEqual(
+            command["automatic_preparation"]["preparation_profile"],
+            "direct_joint_minimal",
+        )
+        self.assertEqual(
+            [step["step"] for step in command["automatic_preparation"]["steps"]],
+            ["dynamic_launch_pos", "ready_service", "activate_service"],
+        )
 
     def test_other_body_publisher_is_rejected(self):
         plugin = enabled_plugin()
@@ -184,6 +201,18 @@ class LowerBodyControlTests(unittest.TestCase):
         self.assertTrue(feedback["verified"])
         self.assertAlmostEqual(feedback["position_error_deg"],
                                math.degrees(0.001))
+
+    def test_feedback_timeout_reports_last_seen_timestamp(self):
+        client = Client({"waist_yaw_joint": 0.0}, received_at_ms=1001)
+        plugin = enabled_plugin(client, settle_timeout_s=0.01)
+        feedback = plugin._wait_for_feedback({
+            "joint_name": "waist_yaw_joint",
+            "target_position_rad_internal": math.radians(10.0),
+            "feedback_before_ms": 1000,
+        })
+        self.assertFalse(feedback["verified"])
+        self.assertEqual(feedback["feedback_received_at_ms"], 1001)
+        self.assertAlmostEqual(feedback["actual_position_deg"], 0.0)
 
     def test_dispatch_returns_verified_feedback_after_publishing(self):
         client = Client()

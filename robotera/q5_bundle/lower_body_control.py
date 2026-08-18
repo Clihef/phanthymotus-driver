@@ -172,6 +172,8 @@ class Plugin:
             "command_message": "xbot_common_interfaces/msg/HybridJointCommand",
             "position_control_prepared": bool(
                 getattr(self._client, "q5_position_control_prepared", False)),
+            "direct_joint_control_prepared": bool(getattr(
+                self._client, "q5_direct_joint_control_prepared", False)),
             "joint_state_fresh": bool(snap.get("fresh", False)),
             "available_joints": [name for name in LOWER_BODY_JOINTS
                                  if name in snap.get("joints", {})],
@@ -284,18 +286,18 @@ class Plugin:
                 joint_name=joint_name,
                 status=status,
             )
-        ensure_active = getattr(self._client, "ensure_q5_position_control_active", None)
+        ensure_active = getattr(self._client, "ensure_q5_direct_joint_active", None)
         if not callable(ensure_active):
             return _failure(
                 "CONTROL_MODE_AUTOMATION_UNAVAILABLE",
-                "q5_control_mode did not register automatic ACTIVE preparation",
+                "q5_control_mode did not register minimal direct-joint ACTIVE preparation",
                 status=status,
             )
         preparation = ensure_active()
         if not isinstance(preparation, dict) or preparation.get("ok") is False:
             return _failure(
                 "AUTO_PREPARE_FAILED",
-                "Could not automatically prepare Q5 position control and ACTIVE state",
+                "Could not automatically prepare minimal direct-joint position control and ACTIVE state",
                 preparation=preparation,
             )
         status = self._safety()
@@ -303,7 +305,7 @@ class Plugin:
         if conflict:
             return conflict
         q5_ready, q5_status = q5_is_control_ready(self._client)
-        if (not status["position_control_prepared"] or not q5_ready
+        if (not status["direct_joint_control_prepared"] or not q5_ready
                 or q5_status.get("state") != 4):
             return _failure(
                 "Q5_FSM_NOT_ACTIVE",
@@ -346,6 +348,7 @@ class Plugin:
         target = command["target_position_rad_internal"]
         before = command.get("feedback_before_ms")
         latest = None
+        latest_received = None
         while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return {
@@ -358,6 +361,8 @@ class Plugin:
             snap = self._client.snapshot()
             actual = snap.get("joints", {}).get(joint_name)
             received = snap.get("received_at_ms")
+            if received is not None:
+                latest_received = received
             is_new = received is not None and (before is None or received > before)
             if snap.get("fresh") and actual is not None:
                 latest = float(actual)
@@ -374,7 +379,7 @@ class Plugin:
             "verified": False,
             "actual_position_deg": None if latest is None else math.degrees(latest),
             "position_error_deg": None if latest is None else math.degrees(abs(latest - target)),
-            "feedback_received_at_ms": None,
+            "feedback_received_at_ms": latest_received,
         }
 
     def _finish(self, result: dict, stop_event):

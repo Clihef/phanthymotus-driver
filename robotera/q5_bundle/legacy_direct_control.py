@@ -101,10 +101,13 @@ class Q5ControlModePlugin:
         # Q5 exposes no service that tells us which DynamicLaunch mode owns
         # ACTIVE. Do not infer direct-position ownership from ACTIVE alone.
         self._client.q5_position_control_prepared = False
+        self._client.q5_direct_joint_control_prepared = False
         # Motion cards use this single coordinator instead of duplicating the
         # vendor transition sequence or reaching into another plugin instance.
         self._client.ensure_q5_position_control_active = (
             self.ensure_position_control_active)
+        self._client.ensure_q5_direct_joint_active = (
+            self.ensure_direct_joint_active)
 
     def get_tool(self):
         return {
@@ -139,6 +142,8 @@ class Q5ControlModePlugin:
         return {
             "q5_fsm": q5_active_status(self._client),
             "position_control_prepared": bool(getattr(self._client, "q5_position_control_prepared", False)),
+            "direct_joint_control_prepared": bool(getattr(
+                self._client, "q5_direct_joint_control_prepared", False)),
             "services": {
                 "dynamic_launch": self._dynamic.service_is_ready(),
                 "ready_service": self._ready.service_is_ready(),
@@ -257,6 +262,80 @@ class Q5ControlModePlugin:
                 "steps": steps,
             })
 
+    def _confirm_direct_joint_telemetry(self, result, before_joint_ms):
+        """Require fresh ACTIVE and a new joint sample after mode takeover."""
+        deadline = time.monotonic() + self._active_confirmation_timeout
+        snapshot = self._client.snapshot()
+        status = q5_active_status(self._client)
+        while time.monotonic() < deadline:
+            received = snapshot.get("received_at_ms")
+            joint_is_new = (received is not None and
+                            (before_joint_ms is None or received > before_joint_ms))
+            if (snapshot.get("fresh") and joint_is_new
+                    and status.get("available") and status.get("fresh")
+                    and status.get("state") == 4):
+                self._client.q5_direct_joint_control_prepared = True
+                return {
+                    **result,
+                    "direct_joint_control_prepared": True,
+                    "q5_fsm": status,
+                    "joint_feedback_received_at_ms": received,
+                }
+            time.sleep(0.05)
+            snapshot = self._client.snapshot()
+            status = q5_active_status(self._client)
+        self._client.q5_direct_joint_control_prepared = False
+        return self._failure(
+            "DIRECT_CONTROL_TELEMETRY_NOT_CONFIRMED",
+            "Position mode reached ACTIVE but fresh post-transition joint feedback was not confirmed",
+            result=result,
+            q5_fsm=status,
+            joint_feedback={
+                "fresh": bool(snapshot.get("fresh")),
+                "received_at_ms": snapshot.get("received_at_ms"),
+                "required_after_ms": before_joint_ms,
+            },
+        )
+
+    def ensure_direct_joint_active(self):
+        """Prepare low-level position control without arm pose actions."""
+        with self._transition_lock:
+            status = q5_active_status(self._client)
+            prepared = bool(getattr(
+                self._client, "q5_direct_joint_control_prepared", False))
+            if (prepared and status.get("available") and status.get("fresh")
+                    and status.get("state") == 4
+                    and self._client.snapshot().get("fresh")):
+                return {
+                    "ok": True,
+                    "state": "active",
+                    "direct_joint_control_prepared": True,
+                    "already_active": True,
+                    "preparation_profile": "direct_joint_minimal",
+                    "steps": [],
+                    "q5_fsm": status,
+                }
+
+            before_joint_ms = self._client.snapshot().get("received_at_ms")
+            self._client.q5_direct_joint_control_prepared = False
+            steps = []
+            # ACTIVE alone does not reveal whether MPC or position mode owns
+            # the controller. Explicitly take over pos mode, but do not run
+            # initpose_handsdown/lift_up for a lower-body command.
+            error = self._to_ready(steps)
+            if error:
+                return error
+            error = self._to_active(steps)
+            if error:
+                return error
+            return self._confirm_direct_joint_telemetry({
+                "ok": True,
+                "state": "active",
+                "direct_joint_control_prepared": False,
+                "preparation_profile": "direct_joint_minimal",
+                "steps": steps,
+            }, before_joint_ms)
+
     def start(self):
         return {"state": "ready", "status": self._status()}
 
@@ -273,6 +352,7 @@ class Q5ControlModePlugin:
         if action == "ready":
             with self._transition_lock:
                 self._client.q5_position_control_prepared = False
+                self._client.q5_direct_joint_control_prepared = False
                 steps = []
                 error = self._to_ready(steps)
                 return error or {"ok": True, "state": "ready", "position_control_prepared": False, "steps": steps}
