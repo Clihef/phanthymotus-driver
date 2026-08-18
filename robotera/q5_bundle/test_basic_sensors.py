@@ -41,6 +41,8 @@ FRESH_JOINT_SNAPSHOT = {
 
 
 class _Client:
+    q5_position_control_prepared = True
+
     def snapshot(self):
         return dict(FRESH_JOINT_SNAPSHOT)
 
@@ -49,6 +51,10 @@ class _Client:
 
     def get_lifecycle_state(self):
         return "active"
+
+    def ensure_q5_position_control_active(self):
+        self.q5_position_control_prepared = True
+        return {"ok": True, "state": "active", "steps": []}
 
 
 class _LifecycleFuture:
@@ -320,7 +326,7 @@ class Q5BasicSensorTests(unittest.TestCase):
             (hand_control, "set", {"targets": [{"joint_name": hand_control.HAND_JOINTS[0], "position_rad": 0.1}]}),
             (hand_gesture, "light_grip", {}),
             (head_control, "neck_yaw", {"neck_yaw_rad": 0.1}),
-            (lower_body_control, "adjust_waist_yaw", {"waist_yaw_delta_rad": 0.01}),
+            (lower_body_control, "set_waist_yaw", {"waist_yaw_position_deg": 1.0}),
         ):
             plugin = module.Plugin({}, "test", None, _Client())
             result = plugin.dispatch(action, args)
@@ -406,22 +412,22 @@ class Q5BasicSensorTests(unittest.TestCase):
         self.assertIs(arm._router, lower._router)
         self.assertEqual(arm._router.status()["topic"], "/wr1_controller/commands")
 
-    def test_lower_body_control_schema_has_safe_relative_defaults(self):
+    def test_lower_body_control_schema_has_absolute_degree_defaults(self):
         plugin = lower_body_control.Plugin({}, "test", None, _Client())
         schema = plugin.get_tool()["inputSchema"]
         self.assertEqual(set(schema["properties"]["action"]["enum"]),
                          set(schema["x-action-params"]))
         expected = {
-            "adjust_ankle": "ankle_delta_rad",
-            "adjust_knee": "knee_delta_rad",
-            "adjust_hip": "hip_delta_rad",
-            "adjust_waist_yaw": "waist_yaw_delta_rad",
+            "set_ankle": ("ankle_position_deg", 0.0, 92.24),
+            "set_knee": ("knee_position_deg", -144.95, 29.79),
+            "set_hip": ("hip_position_deg", -29.79, 89.95),
+            "set_waist_yaw": ("waist_yaw_position_deg", -89.95, 89.95),
         }
-        for action, field in expected.items():
+        for action, (field, minimum, maximum) in expected.items():
             definition = schema["properties"][field]
             self.assertEqual(definition["default"], 0.0)
-            self.assertEqual(definition["minimum"], -0.03)
-            self.assertEqual(definition["maximum"], 0.03)
+            self.assertEqual(definition["minimum"], minimum)
+            self.assertEqual(definition["maximum"], maximum)
             self.assertEqual(schema["x-action-params"][action]["params"], [field])
         self.assertEqual(set(lower_body_control.LOWER_BODY_JOINTS), {
             "ankle_joint", "knee_joint", "hip_joint", "waist_yaw_joint",
@@ -431,10 +437,10 @@ class Q5BasicSensorTests(unittest.TestCase):
         plugin = lower_body_control.Plugin({"enabled": True}, "test", None, _Client())
         self.assertIsNone(plugin._router)
         self.assertEqual(plugin.dispatch("start", {})["state"], "disabled")
-        result = plugin.dispatch("adjust_knee", {"knee_delta_rad": 0.01})
+        result = plugin.dispatch("set_knee", {"knee_position_deg": 0.0})
         self.assertEqual(result["code"], "LOWER_BODY_CONTROL_DISABLED")
 
-    def test_lower_body_relative_target_uses_live_feedback_and_urdf_limits(self):
+    def test_lower_body_absolute_degree_target_uses_urdf_limits(self):
         class ActiveClient(_Client):
             q5_position_control_prepared = True
 
@@ -456,22 +462,10 @@ class Q5BasicSensorTests(unittest.TestCase):
             "other_publishers": [],
             "same_name_publisher_count": 1,
         }
-        command = plugin._validate_adjustment("adjust_knee", 0.02)
-        self.assertAlmostEqual(command["current_position_rad"], -0.50)
-        self.assertAlmostEqual(command["target_position_rad"], -0.48)
-        rejected = plugin._validate_adjustment("adjust_knee", 0.031)
-        self.assertEqual(rejected["code"], "DELTA_LIMIT_EXCEEDED")
-
-        near_limit = ActiveClient()
-        near_limit.snapshot = lambda: {
-            **FRESH_JOINT_SNAPSHOT,
-            "received_at_ms": 1000,
-            "joints": {"ankle_joint": 1.60},
-        }
-        near_limit.q5_position_control_prepared = True
-        limited = lower_body_control.Plugin({"hardware_enable": True}, "test", None, near_limit)
-        limited._router.status = plugin._router.status
-        result = limited._validate_adjustment("adjust_ankle", 0.02)
+        command = plugin._validate_adjustment("set_knee", -20.0)
+        self.assertAlmostEqual(command["current_position_deg"], math.degrees(-0.50))
+        self.assertAlmostEqual(command["target_position_rad_internal"], math.radians(-20.0))
+        result = plugin._validate_adjustment("set_ankle", 93.0)
         self.assertEqual(result["code"], "LIMIT_EXCEEDED")
 
     def test_lower_body_feedback_requires_a_new_sample_within_tolerance(self):
@@ -485,16 +479,16 @@ class Q5BasicSensorTests(unittest.TestCase):
 
         plugin = lower_body_control.Plugin(
             {"hardware_enable": True, "settle_timeout_s": 0.05,
-             "settle_tolerance_rad": 0.005},
+             "settle_tolerance_deg": math.degrees(0.005)},
             "test", None, FeedbackClient(),
         )
         feedback = plugin._wait_for_feedback({
             "joint_name": "waist_yaw_joint",
-            "target_position_rad": 0.02,
+            "target_position_rad_internal": 0.02,
             "feedback_before_ms": 1000,
         })
         self.assertTrue(feedback["verified"])
-        self.assertAlmostEqual(feedback["position_error_rad"], 0.001)
+        self.assertAlmostEqual(feedback["position_error_deg"], math.degrees(0.001))
 
     def test_arm_control_is_hard_disabled_without_explicit_hardware_enable(self):
         plugin = arm_control.Plugin({"enabled": True, "hardware_enable": False}, "test", None, _Client())

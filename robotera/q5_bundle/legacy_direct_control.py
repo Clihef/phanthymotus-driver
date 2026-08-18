@@ -85,8 +85,13 @@ class Q5ControlModePlugin:
     """Vendor Q5 control-mode transitions, kept separate from joint movement."""
 
     def __init__(self, plugin_config, namespace, executor, client):
-        del plugin_config, namespace
+        del namespace
         self._client = client
+        self._transition_lock = threading.Lock()
+        self._active_confirmation_timeout = float(
+            plugin_config.get("active_confirmation_timeout_s", 5.0))
+        if self._active_confirmation_timeout <= 0:
+            raise ValueError("active_confirmation_timeout_s must be positive")
         self._node = Node("q5_control_mode")
         executor.add_node(self._node)
         self._dynamic = self._node.create_client(DynamicLaunch, "/dynamic_launch")
@@ -96,6 +101,10 @@ class Q5ControlModePlugin:
         # Q5 exposes no service that tells us which DynamicLaunch mode owns
         # ACTIVE. Do not infer direct-position ownership from ACTIVE alone.
         self._client.q5_position_control_prepared = False
+        # Motion cards use this single coordinator instead of duplicating the
+        # vendor transition sequence or reaching into another plugin instance.
+        self._client.ensure_q5_position_control_active = (
+            self.ensure_position_control_active)
 
     def get_tool(self):
         return {
@@ -173,6 +182,23 @@ class Q5ControlModePlugin:
                       "message": getattr(response, "message", "timeout") if response else "timeout"})
         return None if success else self._failure("ACTIVATE_FAILED", "Q5 activation failed", steps=steps)
 
+    def _confirm_active(self, result):
+        deadline = time.monotonic() + self._active_confirmation_timeout
+        status = q5_active_status(self._client)
+        while (not status.get("available") or not status.get("fresh")
+               or status.get("state") != 4) and time.monotonic() < deadline:
+            time.sleep(0.05)
+            status = q5_active_status(self._client)
+        if status.get("available") and status.get("fresh") and status.get("state") == 4:
+            return {**result, "q5_fsm": status}
+        self._client.q5_position_control_prepared = False
+        return self._failure(
+            "ACTIVE_STATE_NOT_CONFIRMED",
+            "Q5 activate service returned but /xbot_state did not confirm fresh ACTIVE",
+            result=result,
+            q5_fsm=status,
+        )
+
     def _prepare(self):
         steps = []
         self._client.q5_position_control_prepared = False
@@ -195,7 +221,41 @@ class Q5ControlModePlugin:
         if error:
             return error
         self._client.q5_position_control_prepared = True
-        return {"ok": True, "state": "active", "position_control_prepared": True, "steps": steps}
+        return self._confirm_active({
+            "ok": True,
+            "state": "active",
+            "position_control_prepared": True,
+            "steps": steps,
+        })
+
+    def ensure_position_control_active(self):
+        """Idempotently prepare position control and confirm fresh ACTIVE."""
+        with self._transition_lock:
+            status = q5_active_status(self._client)
+            prepared = bool(getattr(
+                self._client, "q5_position_control_prepared", False))
+            if (prepared and status.get("available") and status.get("fresh")
+                    and status.get("state") == 4):
+                return {
+                    "ok": True,
+                    "state": "active",
+                    "position_control_prepared": True,
+                    "already_active": True,
+                    "steps": [],
+                    "q5_fsm": status,
+                }
+            if not prepared:
+                return self._prepare()
+            steps = []
+            error = self._to_active(steps)
+            if error:
+                return error
+            return self._confirm_active({
+                "ok": True,
+                "state": "active",
+                "position_control_prepared": True,
+                "steps": steps,
+            })
 
     def start(self):
         return {"state": "ready", "status": self._status()}
@@ -208,18 +268,27 @@ class Q5ControlModePlugin:
         if action in ("start", "info"):
             return {"ok": True, "state": "ready", "status": self._status()}
         if action == "prepare_position_control":
-            return self._prepare()
+            with self._transition_lock:
+                return self._prepare()
         if action == "ready":
-            self._client.q5_position_control_prepared = False
-            steps = []
-            error = self._to_ready(steps)
-            return error or {"ok": True, "state": "ready", "position_control_prepared": False, "steps": steps}
+            with self._transition_lock:
+                self._client.q5_position_control_prepared = False
+                steps = []
+                error = self._to_ready(steps)
+                return error or {"ok": True, "state": "ready", "position_control_prepared": False, "steps": steps}
         if action == "active":
-            steps = []
-            error = self._to_active(steps)
-            return error or {"ok": True, "state": "active",
-                             "position_control_prepared": bool(getattr(self._client, "q5_position_control_prepared", False)),
-                             "steps": steps}
+            with self._transition_lock:
+                steps = []
+                error = self._to_active(steps)
+                if error:
+                    return error
+                return self._confirm_active({
+                    "ok": True,
+                    "state": "active",
+                    "position_control_prepared": bool(getattr(
+                        self._client, "q5_position_control_prepared", False)),
+                    "steps": steps,
+                })
         return None
 
 

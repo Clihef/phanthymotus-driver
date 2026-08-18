@@ -78,6 +78,7 @@ plugins:
     settle_timeout_s: 1.5
   q5_control_mode:
     enabled: true
+    active_confirmation_timeout_s: 5.0
   hand_control:
     enabled: true
     min_position_rad: 0.0
@@ -102,15 +103,13 @@ plugins:
     hold_repetitions: 3
   lower_body_control:
     enabled: true
-    # Waist/hip/knee/ankle are load-bearing joints. Keep physical execution
-    # disabled until the guarded relative-motion card is validated on the
-    # target Q5 with an operator holding the emergency stop.
-    hardware_enable: false
-    max_delta_rad: 0.030
-    max_step_rad: 0.005
+    # This card automatically prepares position control and enters ACTIVE.
+    # Keep the operator at the emergency stop while validating load-bearing joints.
+    hardware_enable: true
+    max_step_deg: 0.3
     publish_rate_hz: 20.0
     hold_repetitions: 3
-    settle_tolerance_rad: 0.020
+    settle_tolerance_deg: 1.0
     settle_timeout_s: 1.5
   odom:
     enabled: true

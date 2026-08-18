@@ -1,9 +1,8 @@
-"""Guarded relative position control for the Q5 lower-body joints.
+"""Guarded absolute position control for the Q5 lower-body joints.
 
 The four supported joints share the body HybridJointCommand publisher with the
-arm and head cards.  Lower-body joints carry the robot, so this card only
-accepts small deltas from fresh measured positions; it never supplies a static
-whole-body pose or assumes that zero is a safe standing position.
+arm and head cards. User-facing targets are absolute degrees and are converted
+to radians only for the Q5 HybridJointCommand interface.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import time
 
 from body_command import get_router
 from control_contract import q5_active_status, q5_is_control_ready
-from joint_limits import JOINT_LIMITS, limits_for
+from joint_limits import JOINT_LIMITS
 
 
 CARD = "lower_body_control"
@@ -22,31 +21,31 @@ TYPE = "actuator"
 TOPIC = "/wr1_controller/commands"
 
 ACTION_DETAILS = {
-    "adjust_ankle": {
+    "set_ankle": {
         "joint_name": "ankle_joint",
-        "field": "ankle_delta_rad",
-        "title": "踝关节俯仰微调",
+        "field": "ankle_position_deg",
+        "title": "设置踝关节角度",
     },
-    "adjust_knee": {
+    "set_knee": {
         "joint_name": "knee_joint",
-        "field": "knee_delta_rad",
-        "title": "膝关节俯仰微调",
+        "field": "knee_position_deg",
+        "title": "设置膝关节角度",
     },
-    "adjust_hip": {
+    "set_hip": {
         "joint_name": "hip_joint",
-        "field": "hip_delta_rad",
-        "title": "胯关节俯仰微调",
+        "field": "hip_position_deg",
+        "title": "设置胯关节角度",
     },
-    "adjust_waist_yaw": {
+    "set_waist_yaw": {
         "joint_name": "waist_yaw_joint",
-        "field": "waist_yaw_delta_rad",
-        "title": "腰部偏航微调",
+        "field": "waist_yaw_position_deg",
+        "title": "设置腰部偏航角度",
     },
 }
 LOWER_BODY_JOINTS = tuple(detail["joint_name"] for detail in ACTION_DETAILS.values())
 DESC = (
-    "Q5 下半身控制：腰、胯、膝、踝四关节相对当前位置的小步微调。"
-    "承重关节默认禁止硬件执行，需完成位置直控准备并显式启用硬件开关。"
+    "Q5 下半身控制：以角度制输入腰、胯、膝、踝四关节的绝对目标位置。"
+    "执行前自动完成位置直控准备并切换至 ACTIVE，目标严格受 Q5 URDF 限位约束。"
 )
 
 
@@ -64,22 +63,27 @@ def _finite_number(value, field: str) -> float:
     return value
 
 
+def _command_view(command: dict) -> dict:
+    """Return degree-only command data for MCP results and card status."""
+    return {key: value for key, value in command.items()
+            if not key.endswith("_rad_internal")}
+
+
 class Plugin:
     def __init__(self, plugin_config, namespace, executor, client):
         del namespace
         self._client = client
         self._hardware_enable = bool(plugin_config.get("hardware_enable", False))
-        self._max_delta = float(plugin_config.get("max_delta_rad", 0.030))
-        self._max_step = float(plugin_config.get("max_step_rad", 0.005))
+        self._max_step_deg = float(plugin_config.get("max_step_deg", 0.3))
+        self._max_step = math.radians(self._max_step_deg)
         self._publish_rate = float(plugin_config.get("publish_rate_hz", 20.0))
         self._hold_repetitions = int(plugin_config.get("hold_repetitions", 3))
-        self._settle_tolerance = float(plugin_config.get("settle_tolerance_rad", 0.020))
+        self._settle_tolerance_deg = float(plugin_config.get("settle_tolerance_deg", 1.0))
+        self._settle_tolerance = math.radians(self._settle_tolerance_deg)
         self._settle_timeout = float(plugin_config.get("settle_timeout_s", 1.5))
-        if min(self._max_delta, self._max_step, self._publish_rate,
+        if min(self._max_step, self._publish_rate,
                self._settle_tolerance, self._settle_timeout) <= 0:
             raise ValueError("lower_body_control limits, rate, and timeout must be positive")
-        if self._max_step > self._max_delta:
-            raise ValueError("lower_body_control max_step_rad cannot exceed max_delta_rad")
         if self._hold_repetitions < 1:
             raise ValueError("lower_body_control hold_repetitions must be at least 1")
         missing_limits = [name for name in LOWER_BODY_JOINTS if name not in JOINT_LIMITS]
@@ -94,20 +98,22 @@ class Plugin:
         self._last_result = None
 
     def get_tool(self) -> dict:
-        delta_fields = {}
+        position_fields = {}
         for detail in ACTION_DETAILS.values():
             joint_name = detail["joint_name"]
             lower, upper = JOINT_LIMITS[joint_name]
-            delta_fields[detail["field"]] = {
+            lower_deg = math.ceil(math.degrees(lower) * 100.0) / 100.0
+            upper_deg = math.floor(math.degrees(upper) * 100.0) / 100.0
+            position_fields[detail["field"]] = {
                 "type": "number",
-                "title": "相对当前角度 (rad)",
-                "minimum": -self._max_delta,
-                "maximum": self._max_delta,
-                "multipleOf": 0.005,
+                "title": "目标绝对角度 (°)",
+                "minimum": lower_deg,
+                "maximum": upper_deg,
+                "multipleOf": 0.1,
                 "default": 0.0,
                 "description": (
-                    f"相对实测当前位置增量，范围[-{self._max_delta:g},{self._max_delta:g}]rad，"
-                    f"默认0不运动；目标仍须位于URDF硬限位[{lower:g},{upper:g}]rad。"
+                    f"绝对关节位置，角度制；默认0°；Q5 URDF限位"
+                    f"[{lower_deg:g}°, {upper_deg:g}°]。"
                 ),
             }
         return {
@@ -129,7 +135,7 @@ class Plugin:
                             {"const": "info", "title": "查看状态"},
                         ],
                     },
-                    **delta_fields,
+                    **position_fields,
                 },
                 "required": ["action"],
                 "additionalProperties": False,
@@ -139,8 +145,8 @@ class Plugin:
                         action: {
                             "params": [detail["field"]],
                             "description": (
-                                f"{detail['title']}；相对当前位置最多±{self._max_delta:g}rad，"
-                                f"默认0rad不运动。"
+                                f"{detail['title']}；输入绝对角度，默认0°，"
+                                "执行前自动准备位置控制并进入ACTIVE。"
                             ),
                         }
                         for action, detail in ACTION_DETAILS.items()
@@ -162,7 +168,7 @@ class Plugin:
         snap = self._client.snapshot()
         router_status.update({
             "hardware_enable": self._hardware_enable,
-            "control_mode": "guarded_relative_joint_position",
+            "control_mode": "guarded_absolute_joint_position",
             "command_message": "xbot_common_interfaces/msg/HybridJointCommand",
             "position_control_prepared": bool(
                 getattr(self._client, "q5_position_control_prepared", False)),
@@ -171,12 +177,17 @@ class Plugin:
                                  if name in snap.get("joints", {})],
             "q5_fsm": q5_active_status(self._client),
             "limits": {
-                "max_delta_rad": self._max_delta,
-                "max_step_rad": self._max_step,
-                "max_interpolation_speed_radps": self._max_step * self._publish_rate,
-                "settle_tolerance_rad": self._settle_tolerance,
+                "max_step_deg": self._max_step_deg,
+                "max_interpolation_speed_degps": self._max_step_deg * self._publish_rate,
+                "settle_tolerance_deg": self._settle_tolerance_deg,
                 "settle_timeout_s": self._settle_timeout,
-                "joint_position_limits": limits_for(LOWER_BODY_JOINTS),
+                "joint_position_limits_deg": {
+                    name: {
+                        "min_deg": math.degrees(JOINT_LIMITS[name][0]),
+                        "max_deg": math.degrees(JOINT_LIMITS[name][1]),
+                    }
+                    for name in LOWER_BODY_JOINTS
+                },
                 "joint_names_source": "q5_model.urdf",
                 "deployment_guardrails_vendor_certified": False,
             },
@@ -205,6 +216,21 @@ class Plugin:
         detail = ACTION_DETAILS[action]
         joint_name = detail["joint_name"]
         field = detail["field"]
+        try:
+            target_deg = _finite_number(value, field)
+        except ValueError as exc:
+            return _failure("INVALID_ARGUMENT", str(exc))
+        target = math.radians(target_deg)
+        lower, upper = JOINT_LIMITS[joint_name]
+        if target < lower or target > upper:
+            return _failure(
+                "LIMIT_EXCEEDED",
+                "Requested absolute target is outside the Q5 URDF joint limit",
+                joint_name=joint_name,
+                target_position_deg=target_deg,
+                min_deg=math.degrees(lower),
+                max_deg=math.degrees(upper),
+            )
         status = self._safety()
         if not self._hardware_enable:
             return _failure(
@@ -227,18 +253,37 @@ class Plugin:
                 "Refusing lower-body motion while another node publishes body commands",
                 status=status,
             )
-        if not status["position_control_prepared"]:
+        preflight_snapshot = self._client.snapshot()
+        if (not preflight_snapshot.get("fresh")
+                or joint_name not in preflight_snapshot.get("joints", {})):
             return _failure(
-                "DIRECT_CONTROL_NOT_PREPARED",
-                "Run q5_control_mode action=prepare_position_control before lower-body control",
+                "JOINT_STATE_UNAVAILABLE",
+                "Fresh target-joint feedback is required before automatic mode changes",
+                joint_name=joint_name,
                 status=status,
             )
+        ensure_active = getattr(self._client, "ensure_q5_position_control_active", None)
+        if not callable(ensure_active):
+            return _failure(
+                "CONTROL_MODE_AUTOMATION_UNAVAILABLE",
+                "q5_control_mode did not register automatic ACTIVE preparation",
+                status=status,
+            )
+        preparation = ensure_active()
+        if not isinstance(preparation, dict) or preparation.get("ok") is False:
+            return _failure(
+                "AUTO_PREPARE_FAILED",
+                "Could not automatically prepare Q5 position control and ACTIVE state",
+                preparation=preparation,
+            )
+        status = self._safety()
         q5_ready, q5_status = q5_is_control_ready(self._client)
-        if not q5_ready or q5_status.get("state") != 4:
+        if (not status["position_control_prepared"] or not q5_ready
+                or q5_status.get("state") != 4):
             return _failure(
                 "Q5_FSM_NOT_ACTIVE",
-                "Q5 must remain fresh and ACTIVE during lower-body control",
-                status={**status, "q5_fsm": q5_status},
+                "Automatic preparation completed without fresh ACTIVE confirmation",
+                status={**status, "q5_fsm": q5_status}, preparation=preparation,
             )
         snap = self._client.snapshot()
         if not snap.get("fresh"):
@@ -254,48 +299,26 @@ class Plugin:
                 "Requested lower-body joint is absent from /joint_states",
                 joint_name=joint_name,
             )
-        try:
-            delta = _finite_number(value, field)
-        except ValueError as exc:
-            return _failure("INVALID_ARGUMENT", str(exc))
-        if abs(delta) > self._max_delta:
-            return _failure(
-                "DELTA_LIMIT_EXCEEDED",
-                "Requested relative movement exceeds the per-call deployment guardrail",
-                joint_name=joint_name,
-                max_delta_rad=self._max_delta,
-                requested_delta_rad=delta,
-            )
-        target = float(current) + delta
-        lower, upper = JOINT_LIMITS[joint_name]
-        if target < lower or target > upper:
-            return _failure(
-                "LIMIT_EXCEEDED",
-                "Computed target is outside the Q5 URDF joint limit",
-                joint_name=joint_name,
-                current_position_rad=float(current),
-                requested_delta_rad=delta,
-                target_position_rad=target,
-                min_rad=lower,
-                max_rad=upper,
-            )
-        duration_s = 0.0 if abs(delta) < 1e-12 else max(
-            0.25, abs(delta) / (self._max_step * self._publish_rate))
+        movement = target - float(current)
+        duration_s = 0.0 if abs(movement) < 1e-12 else max(
+            0.25, abs(movement) / (self._max_step * self._publish_rate))
         return {
             "action": action,
             "joint_name": joint_name,
             "field": field,
-            "current_position_rad": float(current),
-            "delta_rad": delta,
-            "target_position_rad": target,
+            "current_position_deg": math.degrees(float(current)),
+            "target_position_deg": target_deg,
+            "current_position_rad_internal": float(current),
+            "target_position_rad_internal": target,
             "duration_s": duration_s,
             "feedback_before_ms": snap.get("received_at_ms"),
+            "automatic_preparation": preparation,
         }
 
     def _wait_for_feedback(self, command: dict, stop_event=None) -> dict:
         deadline = time.monotonic() + self._settle_timeout
         joint_name = command["joint_name"]
-        target = command["target_position_rad"]
+        target = command["target_position_rad_internal"]
         before = command.get("feedback_before_ms")
         latest = None
         while time.monotonic() < deadline:
@@ -303,8 +326,8 @@ class Plugin:
                 return {
                     "verified": False,
                     "cancelled": True,
-                    "actual_position_rad": latest,
-                    "position_error_rad": None if latest is None else abs(latest - target),
+                    "actual_position_deg": None if latest is None else math.degrees(latest),
+                    "position_error_deg": None if latest is None else math.degrees(abs(latest - target)),
                     "feedback_received_at_ms": None,
                 }
             snap = self._client.snapshot()
@@ -317,15 +340,15 @@ class Plugin:
                 if is_new and error <= self._settle_tolerance:
                     return {
                         "verified": True,
-                        "actual_position_rad": latest,
-                        "position_error_rad": error,
+                        "actual_position_deg": math.degrees(latest),
+                        "position_error_deg": math.degrees(error),
                         "feedback_received_at_ms": received,
                     }
             time.sleep(0.02)
         return {
             "verified": False,
-            "actual_position_rad": latest,
-            "position_error_rad": None if latest is None else abs(latest - target),
+            "actual_position_deg": None if latest is None else math.degrees(latest),
+            "position_error_deg": None if latest is None else math.degrees(abs(latest - target)),
             "feedback_received_at_ms": None,
         }
 
@@ -339,8 +362,8 @@ class Plugin:
 
     def _run_move(self, stop_event, command: dict):
         joint_name = command["joint_name"]
-        current = command["current_position_rad"]
-        target = command["target_position_rad"]
+        current = command["current_position_rad_internal"]
+        target = command["target_position_rad_internal"]
         duration_s = command["duration_s"]
         steps = max(
             int(math.ceil(abs(target - current) / self._max_step)),
@@ -363,7 +386,7 @@ class Plugin:
                     "state": "stopped",
                     "code": "CANCELLED",
                     "message": "Lower-body adjustment cancelled; latest measured position held",
-                    "command": dict(command),
+                    "command": _command_view(command),
                     "feedback_verified": False,
                     "hold_command_published": held,
                 }
@@ -371,7 +394,7 @@ class Plugin:
                 result = _failure(
                     "PUBLISH_FAILED",
                     "Q5 lower-body command could not be published",
-                    command=command,
+                    command=_command_view(command),
                 )
             else:
                 self._hold_position(joint_name, target)
@@ -383,7 +406,7 @@ class Plugin:
                         "state": "stopped",
                         "code": "CANCELLED",
                         "message": "Lower-body adjustment cancelled while waiting for feedback",
-                        "command": dict(command),
+                        "command": _command_view(command),
                         "feedback_verified": False,
                         "feedback": feedback,
                         "hold_command_published": held,
@@ -392,7 +415,7 @@ class Plugin:
                     result = {
                         "ok": True,
                         "state": "succeeded",
-                        "command": dict(command),
+                        "command": _command_view(command),
                         "feedback_verified": True,
                         "feedback": feedback,
                     }
@@ -400,17 +423,17 @@ class Plugin:
                     result = _failure(
                         "FEEDBACK_TIMEOUT",
                         "Command was published but fresh target feedback was not verified before timeout",
-                        command=command,
+                        command=_command_view(command),
                         feedback=feedback,
                         settle_timeout_s=self._settle_timeout,
-                        settle_tolerance_rad=self._settle_tolerance,
+                        settle_tolerance_deg=self._settle_tolerance_deg,
                     )
         except Exception as exc:
             result = _failure(
                 "INTERNAL_ERROR",
                 "Lower-body motion worker failed",
                 exception=str(exc),
-                command=command,
+                command=_command_view(command),
             )
         finally:
             if self._router is not None:
@@ -469,10 +492,10 @@ class Plugin:
             return {
                 "ok": True,
                 "state": "succeeded",
-                "command": command,
+                "command": _command_view(command),
                 "no_op": True,
                 "feedback_verified": True,
-                "message": "Requested delta is zero; no command was published",
+                "message": "Joint is already at the requested absolute target; no command was published",
             }
         if not self._router.acquire(CARD):
             return _failure(
@@ -489,7 +512,7 @@ class Plugin:
                 )
             stop_event = threading.Event()
             self._motion_stop = stop_event
-            self._active_command = dict(command)
+            self._active_command = _command_view(command)
             thread = threading.Thread(
                 target=self._run_move,
                 args=(stop_event, command),
@@ -508,7 +531,7 @@ class Plugin:
         return result or {
             "ok": True,
             "state": "moving",
-            "command": command,
+            "command": _command_view(command),
             "feedback_verified": False,
         }
 

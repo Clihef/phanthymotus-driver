@@ -16,27 +16,27 @@ RobotEra Q5 的 MCP 驱动 bundle。插件由 `main.py` 按 `config.yaml` 动态
 
 `lower_body_control` 将四个下半身关节合并为一张卡：
 
-| Action | 关节 | 参数 | 单次默认/范围 |
+| Action | 关节 | 参数 | 默认值 / Q5 URDF 范围 |
 |---|---|---|---|
-| `adjust_ankle` | `ankle_joint` | `ankle_delta_rad` | 默认 0，范围 [-0.03, 0.03] rad |
-| `adjust_knee` | `knee_joint` | `knee_delta_rad` | 默认 0，范围 [-0.03, 0.03] rad |
-| `adjust_hip` | `hip_joint` | `hip_delta_rad` | 默认 0，范围 [-0.03, 0.03] rad |
-| `adjust_waist_yaw` | `waist_yaw_joint` | `waist_yaw_delta_rad` | 默认 0，范围 [-0.03, 0.03] rad |
+| `set_ankle` | `ankle_joint` | `ankle_position_deg` | 0° / [0°, 92.24°] |
+| `set_knee` | `knee_joint` | `knee_position_deg` | 0° / [-144.95°, 29.79°] |
+| `set_hip` | `hip_joint` | `hip_position_deg` | 0° / [-29.79°, 89.95°] |
+| `set_waist_yaw` | `waist_yaw_joint` | `waist_yaw_position_deg` | 0° / [-89.95°, 89.95°] |
 | `cancel` | 当前运动关节 | 无 | 取消插补并保持最新实测位置 |
 | `info` | 全部 | 无 | 返回动作、反馈、控制锁和安全条件 |
 
-四个动作都使用相对实测当前位置的小增量，计算出的绝对目标还会再次通过
-`resource/q5_model.urdf` 的关节硬限位。动作要求：
+四个动作都接收角度制的绝对关节位置，内部转换为弧度后发送。目标会再次通过
+`resource/q5_model.urdf` 的关节硬限位。动作执行时会自动完成以下前置流程：
 
-1. `q5_control_mode` 已完成 `prepare_position_control`；
-2. `/xbot_state` 新鲜且为 `ACTIVE`；
-3. `/joint_states` 新鲜并包含目标关节；
-4. `/wr1_controller/commands` 没有其他发布者或卡片持有租约；
-5. 完成后收到更新的关节反馈，误差在配置容差内。
+1. 未准备位置直控时，自动执行 `pos → READY → 垂手 → 抬臂 → ACTIVE`；
+2. 已准备但不在 ACTIVE 时，自动调用厂商 `activate_service`；
+3. 必须由 `/xbot_state` 新鲜反馈确认机器人已进入 `ACTIVE`；
+4. `/joint_states` 新鲜并包含目标关节；
+5. `/wr1_controller/commands` 没有其他发布者或卡片持有租约；
+6. 完成后收到更新的关节反馈，误差在配置容差内。
 
-承重关节会直接影响机器人稳定性，因此默认配置为
-`hardware_enable: false`。实机启用前必须清空工作区、固定或支撑机器人、准备急停，
-并从最小增量开始验证。配置中的增量、步长和反馈容差是部署保护值，不是厂商认证限位。
+承重关节会直接影响机器人稳定性。当前配置启用硬件执行；测试时必须清空工作区、
+固定或支撑机器人并准备急停。插补步长、速度和反馈容差是部署保护值，不是厂商认证限位。
 
 ## 本地检查
 
